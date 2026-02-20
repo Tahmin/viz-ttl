@@ -8,12 +8,24 @@ Supports uploading one or multiple CSV files via the UI.
 import base64
 import io
 import json
+import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from dash import Dash, dcc, html, Input, Output, State, callback, ctx, no_update
+from dotenv import load_dotenv
 from plotly.subplots import make_subplots
+
+# ── OpenAI Integration ──
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ── Influenza A segment annotations (by reference size descending) ──
 SEGMENT_ANNOTATION = {
@@ -121,6 +133,24 @@ SAMPLE_PALETTE = [
     "#eab308", "#ef4444", "#0ea5e9", "#84cc16", "#d946ef",
 ]
 
+# ── OpenAI Configuration ──
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = "gpt-4-turbo-preview"
+MAX_CHAT_HISTORY = 10  # Store last 10 messages
+CHAT_SYSTEM_PROMPT = """You are a helpful data analyst assistant for a genomic surveillance dashboard.
+You have access to an Influenza A virus dataset with positive control QC metrics.
+
+The dataset contains:
+- TASS Score: Quality metric for HIV sequence data (higher is better)
+- Breadth Coverage: Percentage of reference genome covered (0-100%)
+- Mean Depth: Average sequencing depth
+- Multiple genome segments (PB2, PB1, PA, HA, NP, NA)
+- Collection dates and geographic locations (US states)
+
+Be concise and analytical. When asked questions, refer to specific metrics and provide data-driven insights.
+If asked about visualizations, suggest which chart type would be best for their question.
+Always be honest if you don't have specific data to answer a question."""
+
 
 def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Add derived columns to a raw CSV dataframe."""
@@ -139,6 +169,81 @@ def build_sample_colors(df: pd.DataFrame) -> dict:
     """Dynamically assign colors to samples."""
     samples = sorted(df["Sample"].unique())
     return {s: SAMPLE_PALETTE[i % len(SAMPLE_PALETTE)] for i, s in enumerate(samples)}
+
+
+# ── OpenAI Helper Functions ──
+def format_dataframe_context(df: pd.DataFrame) -> str:
+    """Format dataframe summary for OpenAI context."""
+    if df is None or df.empty:
+        return "No data available. Please upload a CSV file."
+
+    # Get basic info
+    n_rows, n_cols = df.shape
+    context = f"Dataset has {n_rows} rows and {n_cols} columns.\n\n"
+
+    # Column info
+    context += "Columns:\n"
+    for col in df.columns:
+        context += f"- {col} ({df[col].dtype})\n"
+
+    # Summary stats for numeric columns
+    context += "\nNumeric Summary Statistics:\n"
+    for col in NUMERIC_COLS:
+        if col in df.columns:
+            context += f"- {col}: min={df[col].min():.2f}, max={df[col].max():.2f}, mean={df[col].mean():.2f}\n"
+
+    # Sample data
+    context += "\nFirst 5 rows of data:\n"
+    context += df.head(5).to_string()
+
+    # Unique samples and states
+    if "Sample" in df.columns:
+        context += f"\n\nUnique samples: {', '.join(sorted(df['Sample'].unique()))}\n"
+    if "state" in df.columns:
+        context += f"States represented: {', '.join(sorted(df['state'].unique()))}\n"
+
+    return context
+
+
+def get_openai_response(user_message: str, df: pd.DataFrame, chat_history: list) -> str:
+    """Get response from OpenAI API."""
+    if not OPENAI_AVAILABLE:
+        return "OpenAI library not installed. Install with: pip install openai"
+
+    if not OPENAI_API_KEY:
+        return "OpenAI API key not found. Set OPENAI_API_KEY environment variable."
+
+    try:
+        # Create client
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+        # Prepare context
+        data_context = format_dataframe_context(df)
+
+        # Build messages with context
+        messages = [
+            {"role": "system", "content": CHAT_SYSTEM_PROMPT + "\n\n" + data_context},
+        ]
+
+        # Add last N messages from history
+        for msg in chat_history[-MAX_CHAT_HISTORY:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+        # Add current user message
+        messages.append({"role": "user", "content": user_message})
+
+        # Call API
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=500,
+        )
+
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        return f"Error calling OpenAI API: {str(e)}"
 
 
 # ── Plotly template ──
@@ -356,10 +461,15 @@ app.layout = html.Div(
             ],
         ),
 
-        # ─── Main content ───
+        # ─── Main content wrapper (grid layout) ───
         html.Div(
-            style={"padding": "28px 40px", "maxWidth": "1480px", "margin": "0 auto"},
+            style={"display": "grid", "gridTemplateColumns": "1fr 300px", "gap": "20px", "padding": "28px 40px",
+                   "maxWidth": "1800px", "margin": "0 auto"},
             children=[
+                # Left column: all existing content
+                html.Div(
+                    style={"minWidth": "0"},
+                    children=[
 
                 # ── Upload status bar ──
                 html.Div(id="upload-status", style={"marginBottom": "20px"}),
@@ -591,6 +701,88 @@ app.layout = html.Div(
                     },
                     children=[
                         html.P("TASS Report Explorer | TaxTriage Genomic Surveillance Pipeline"),
+                    ],
+                ),
+                ]),
+
+                # Right column: chat panel
+                html.Div(
+                    style={
+                        "display": "flex", "flexDirection": "column", "height": "calc(100vh - 200px)",
+                        "background": f"linear-gradient(135deg, {COLORS['card']} 0%, {COLORS['bg']} 100%)",
+                        "border": f"1px solid {COLORS['card_border']}",
+                        "borderRadius": "12px",
+                        "padding": "20px",
+                        "boxSizing": "border-box",
+                        "position": "sticky", "top": "100px",
+                    },
+                    children=[
+                        # Chat header
+                        html.Div(
+                            style={"fontSize": "16px", "fontWeight": "700", "marginBottom": "16px", "color": COLORS["accent"]},
+                            children="Data Chat",
+                        ),
+
+                        # Chat history store
+                        dcc.Store(id="chat-history", data=[]),
+
+                        # Messages container
+                        html.Div(
+                            id="chat-messages",
+                            style={
+                                "flex": "1",
+                                "overflowY": "auto",
+                                "marginBottom": "16px",
+                                "paddingRight": "8px",
+                                "display": "flex",
+                                "flexDirection": "column",
+                                "gap": "12px",
+                            },
+                            children=[
+                                html.Div(
+                                    style={
+                                        "fontSize": "12px", "color": COLORS["text_muted"],
+                                        "textAlign": "center", "padding": "20px 10px",
+                                    },
+                                    children="Upload data and ask questions about it.",
+                                ),
+                            ],
+                        ),
+
+                        # Chat input
+                        dcc.Textarea(
+                            id="chat-input",
+                            placeholder="Ask a question about the data...",
+                            style={
+                                "width": "100%", "minHeight": "60px", "maxHeight": "120px",
+                                "padding": "10px", "marginBottom": "10px",
+                                "borderRadius": "8px",
+                                "border": f"1px solid {COLORS['card_border']}",
+                                "backgroundColor": COLORS["bg"],
+                                "color": COLORS["text"],
+                                "fontFamily": "Inter, system-ui, sans-serif",
+                                "fontSize": "12px",
+                                "resize": "none",
+                            },
+                        ),
+
+                        # Send button
+                        html.Button(
+                            "Send",
+                            id="chat-send",
+                            style={
+                                "width": "100%",
+                                "padding": "10px 16px",
+                                "backgroundColor": COLORS["accent"],
+                                "color": COLORS["bg"],
+                                "border": "none",
+                                "borderRadius": "8px",
+                                "fontWeight": "600",
+                                "fontSize": "12px",
+                                "cursor": "pointer",
+                            },
+                            n_clicks=0,
+                        ),
                     ],
                 ),
             ],
@@ -1362,6 +1554,115 @@ def update_table(store_data, samples, states, segments):
             ]),
         ],
     )
+
+
+# ── Chat Callbacks ──
+
+@callback(
+    Output("chat-messages", "children"),
+    Input("chat-history", "data"),
+)
+def render_chat_messages(chat_history):
+    """Render chat message bubbles from history."""
+    if not chat_history:
+        return [
+            html.Div(
+                style={
+                    "fontSize": "12px", "color": COLORS["text_muted"],
+                    "textAlign": "center", "padding": "20px 10px",
+                },
+                children="Upload data and ask questions about it.",
+            ),
+        ]
+
+    messages = []
+    for msg in chat_history:
+        is_user = msg["role"] == "user"
+        messages.append(
+            html.Div(
+                style={
+                    "display": "flex",
+                    "justifyContent": "flex-end" if is_user else "flex-start",
+                    "marginBottom": "8px",
+                },
+                children=[
+                    html.Div(
+                        msg["content"],
+                        style={
+                            "maxWidth": "90%",
+                            "padding": "10px 12px",
+                            "borderRadius": "8px",
+                            "fontSize": "12px",
+                            "lineHeight": "1.4",
+                            "backgroundColor": COLORS["accent"] if is_user else COLORS["card_border"],
+                            "color": COLORS["bg"] if is_user else COLORS["text"],
+                            "wordWrap": "break-word",
+                        },
+                    ),
+                ],
+            ),
+        )
+    return messages
+
+
+@callback(
+    Output("chat-history", "data"),
+    Output("chat-input", "value"),
+    Input("chat-send", "n_clicks"),
+    Input("data-store", "data"),
+    State("chat-input", "value"),
+    State("chat-history", "data"),
+    prevent_initial_call=True,
+)
+def update_chat(send_clicks, store_data, input_value, chat_history):
+    """Handle both sending messages and clearing chat on new upload."""
+    # Check which callback was triggered
+    triggered_input = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
+
+    # If data-store changed (new upload), clear chat
+    if triggered_input == "data-store":
+        return [], ""
+
+    # If chat-send was clicked, process the message
+    if triggered_input == "chat-send":
+        # Check if triggered and has input
+        if not input_value or not input_value.strip():
+            return chat_history, ""
+
+        # Check if data is available
+        if not store_data:
+            error_msg = "Please upload data first."
+            chat_history = chat_history or []
+            chat_history.append({"role": "user", "content": input_value})
+            chat_history.append({"role": "assistant", "content": error_msg})
+            return chat_history, ""
+
+        # Reconstruct DataFrame from store
+        try:
+            df = df_from_store(store_data)
+        except Exception as e:
+            error_msg = f"Error loading data: {str(e)}"
+            chat_history = chat_history or []
+            chat_history.append({"role": "user", "content": input_value})
+            chat_history.append({"role": "assistant", "content": error_msg})
+            return chat_history, ""
+
+        # Initialize history if needed
+        chat_history = chat_history or []
+
+        # Add user message
+        chat_history.append({"role": "user", "content": input_value.strip()})
+
+        # Get AI response
+        response = get_openai_response(input_value.strip(), df, chat_history)
+        chat_history.append({"role": "assistant", "content": response})
+
+        # Return updated history and cleared input
+        return chat_history, ""
+
+    # No change
+    return chat_history, ""
+
 
 
 if __name__ == "__main__":
